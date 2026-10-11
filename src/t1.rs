@@ -66,6 +66,8 @@ const MISC_INT2_SOURCE: u8 = 0x08;
 const MISC_INT2_MASK: u8 = 0x09;
 /// Communication ready (link up).
 const INT2_COMM_READY: u16 = 1 << 10;
+/// DSP bank: coefficient read control. Bit 0 strobes the SQI registers' update.
+const DSP_COEF_RW_CTL: u8 = 0x0D;
 /// DSP bank: signal quality.
 const DSP_DCQ_SQI: u8 = 0xC3;
 
@@ -294,6 +296,8 @@ impl<SPI: SpiDevice, D: DelayNs> Lan937x<SPI, D> {
 
     /// The current signal quality of `port`'s link, 0 (worst) to 7 (best).
     pub async fn t1_sqi(&mut self, port: Port) -> Result<u8, Error<SPI::Error>> {
+        // The value Linux writes (`lan87xx_get_sqi`); bits 9:8 are reserved.
+        self.t1_write(port, Bank::Dsp, DSP_COEF_RW_CTL, 0x0301).await?;
         Ok(((self.t1_read(port, Bank::Dsp, DSP_DCQ_SQI).await? >> 1) & 0x7) as u8)
     }
 
