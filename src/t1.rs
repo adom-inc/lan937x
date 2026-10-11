@@ -58,6 +58,8 @@ pub const INT_LINK_UP: u16 = 1 << 2;
 /// Power-down control.
 pub const POWER_DOWN_CTL: u8 = 0x1A;
 
+/// Misc bank: control 0. Bits 2:0 are the LED mode.
+const MISC_CTRL_0: u8 = 0x10;
 /// Misc bank: interrupt 2 source (read to clear).
 const MISC_INT2_SOURCE: u8 = 0x08;
 /// Misc bank: interrupt 2 mask (1 = enabled).
@@ -73,6 +75,7 @@ pub const PHY_ID: u32 = 0x0007_c180;
 pub const PHY_ID_MASK: u32 = 0xffff_fff0;
 
 /// A register bank.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Bank {
@@ -86,6 +89,28 @@ pub enum Bank {
     Afe = 3,
     /// DSP.
     Dsp = 4,
+}
+
+/// What a T1 PHY's LED signal shows.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum LedMode {
+    /// Link up (the reset default).
+    Link = 0b000,
+    /// Link up with the remote receiver OK.
+    LinkRemote = 0b001,
+    /// Link up with the local receiver OK.
+    LinkLocal = 0b010,
+    /// Activity.
+    #[default]
+    Activity = 0b011,
+    /// Receive activity.
+    RxActivity = 0b100,
+    /// Transmit activity.
+    TxActivity = 0b101,
+    /// Master (leader) or slave.
+    Role = 0b110,
 }
 
 /// 100BASE-T1 has no autonegotiation: the two ends of a link must be
@@ -258,6 +283,13 @@ impl<SPI: SpiDevice, D: DelayNs> Lan937x<SPI, D> {
             bmcr & !BMCR_LOOPBACK
         };
         self.phy_write(port, BMCR, bmcr).await
+    }
+
+    /// Set what `port`'s PHY LED signal shows. A PHY reset reverts it.
+    pub async fn t1_set_led_mode(&mut self, port: Port, mode: LedMode) -> Result<(), Error<SPI::Error>> {
+        let ctrl = self.t1_read(port, Bank::Misc, MISC_CTRL_0).await?;
+        self.t1_write(port, Bank::Misc, MISC_CTRL_0, (ctrl & !0b111) | mode as u16)
+            .await
     }
 
     /// The current signal quality of `port`'s link, 0 (worst) to 7 (best).

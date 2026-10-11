@@ -71,6 +71,10 @@ pub struct Config {
     pub other_xmii: Option<(Port, Xmii)>,
     /// The spanning-tree state user ports start in.
     pub initial_state: StpState,
+    /// The T1 LED pins: `t1_leds[n]` is the port LED_(n+1) shows (see
+    /// [`Lan937x::set_t1_leds`]). Empty leaves the reset mapping, LED_(n+1)
+    /// showing AFE n.
+    pub t1_leds: &'static [Option<Port>],
     /// The switch's MAC address, the source of pause frames.
     pub mac: [u8; 6],
 }
@@ -106,6 +110,20 @@ mod resv_group {
     pub const GVRP: u8 = 0x21;
     /// `-11`..`-1F`, `-22`..`-2F`.
     pub const OTHER: u8 = 0x11;
+}
+
+/// The T1 AFE (analog front end) of a LAN9374 port's integrated PHY, or `None`
+/// for its xMII ports.
+pub const fn lan9374_afe(port: Port) -> Option<u8> {
+    match port.0 {
+        0 => Some(0),
+        1 => Some(1),
+        2 => Some(3),
+        3 => Some(5),
+        6 => Some(4),
+        7 => Some(2),
+        _ => None,
+    }
 }
 
 /// A LAN937x switch on SPI.
@@ -200,6 +218,10 @@ impl<SPI: SpiDevice, D: DelayNs> Lan937x<SPI, D> {
         self.init_host_port(config.host, config.host_xmii).await?;
         if let Some((port, xmii)) = config.other_xmii {
             self.configure_xmii(port, xmii).await?;
+        }
+
+        if !config.t1_leds.is_empty() {
+            self.set_t1_leds(config.t1_leds).await?;
         }
 
         self.init_reserved_multicast(config.host).await?;
@@ -436,6 +458,20 @@ impl<SPI: SpiDevice, D: DelayNs> Lan937x<SPI, D> {
             .await
     }
 
+    /// Choose what the T1 LED pins show: `leds[n]` is the port whose PHY LED
+    /// drives LED_(n+1), or `None` for off. At most 10 LEDs (LAN9374: 6).
+    pub async fn set_t1_leds(&mut self, leds: &[Option<Port>]) -> Result<(), Error<SPI::Error>> {
+        const OFF: u32 = 0b111;
+        let mut select = 0;
+        for i in 0..10 {
+            let afe = leds.get(i).copied().flatten().and_then(lan9374_afe);
+            select |= afe.map_or(OFF, u32::from) << (3 * i);
+        }
+        // The LED function, not general purpose outputs, on the selected pins.
+        self.spi.modify32(reg::GLB_LED_OVR, (1 << leds.len()) - 1, 0).await?;
+        self.spi.write32(reg::GLB_LED_T1_SEL, select & 0x3fff_ffff).await
+    }
+
     /// Write a port's spanning-tree state register. Membership is separate,
     /// see [`write_membership`](Self::write_membership).
     pub async fn write_stp_state(&mut self, port: Port, state: StpState) -> Result<(), Error<SPI::Error>> {
@@ -445,6 +481,17 @@ impl<SPI: SpiDevice, D: DelayNs> Lan937x<SPI, D> {
                 reg::STP_TX_EN | reg::STP_RX_EN | reg::STP_LEARN_DIS,
                 state.register(),
             )
+            .await?;
+        Ok(())
+    }
+
+    /// Stop or allow learning on a port, whatever its spanning-tree state.
+    /// A [`write_stp_state`](Self::write_stp_state) sets learning per the
+    /// state again.
+    pub async fn set_learning(&mut self, port: Port, learn: bool) -> Result<(), Error<SPI::Error>> {
+        let disable = if learn { 0 } else { reg::STP_LEARN_DIS };
+        self.spi
+            .modify8(reg::port(port, reg::P_STP_STATE), reg::STP_LEARN_DIS, disable)
             .await?;
         Ok(())
     }

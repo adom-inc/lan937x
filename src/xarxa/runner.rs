@@ -7,7 +7,9 @@ use embedded_hal_async::spi::SpiDevice;
 use xarxa_driver::{Timestamp, TxTimestamp};
 use xarxa_dsa::{PortEvent, PortId, PortLink, StpState};
 
-use super::state::{MAX_PORTS, SwitchState, T1_LINK, TX_TIMESTAMP_TIMEOUT, link_from};
+use super::state::{
+    DiagError, DiagRequest, MAX_PORTS, RegWidth, SwitchState, T1_LINK, TX_TIMESTAMP_TIMEOUT, link_from,
+};
 use crate::fmt::{debug, info, warning};
 use crate::ptp::{self, TxClass};
 use crate::t1::{Role, T1Init};
@@ -34,6 +36,9 @@ pub struct Runner<'a, SPI, D, IRQ> {
     next_link_poll: Instant,
     next_mib: Instant,
     mib_port: u8,
+    /// T1 ports whose PHY is in loopback. They don't learn: everything that
+    /// comes back in on them was sent by someone else.
+    looped: u8,
     /// IRQ_N stayed asserted after servicing: a source this runner doesn't
     /// clear. Don't spin on it.
     irq_stuck: bool,
@@ -70,6 +75,7 @@ where
             next_link_poll: now + LINK_POLL,
             next_mib: now + MIB_TICK,
             mib_port: 0,
+            looped: 0,
             irq_stuck: false,
         }
     }
@@ -109,12 +115,17 @@ where
     async fn service(&mut self) -> Result<(), Error<SPI::Error>> {
         self.apply_stp().await?;
         self.apply_flushes().await?;
+        if let Some(request) = self.state.diag_request.try_take() {
+            let result = self.run_diag(request).await;
+            self.state.diag_response.signal(result);
+        }
         if self.irq.is_low().unwrap_or(false) {
             self.service_interrupts().await?;
         }
         self.apply_phc_requests().await?;
         self.apply_external_links().await?;
         self.apply_loopbacks().await?;
+        self.apply_led_modes().await?;
         self.t1_init_step().await?;
 
         let now = Instant::now();
@@ -169,8 +180,14 @@ where
                     if view.applied == StpState::Forwarding {
                         forwarding |= 1 << i;
                     }
-                    if next.is_none() && view.requested != view.applied {
-                        next = Some((i, view.requested, view.applied));
+                    // An administratively disabled port is disabled in hardware.
+                    let target = if inner.ports[i].enabled {
+                        view.requested
+                    } else {
+                        StpState::Disabled
+                    };
+                    if next.is_none() && target != view.applied {
+                        next = Some((i, target, view.applied));
                     }
                 }
                 next.map(|n| (n, forwarding))
@@ -190,6 +207,9 @@ where
             } else {
                 self.dev.write_membership(config.ports, config.host, forwarding).await?;
                 self.dev.write_stp_state(port, target.into()).await?;
+            }
+            if self.looped & (1 << i) != 0 {
+                self.dev.set_learning(port, false).await?;
             }
             self.state.lock(|inner| inner.ports[i].stp.applied = target);
             debug!("lan937x: port {} now {}", port.datasheet_number(), target);
@@ -323,8 +343,39 @@ where
             let Some(on) = self.state.lock(|inner| inner.ports[i].loopback.take()) else {
                 continue;
             };
-            self.dev.t1_set_loopback(Port(i as u8), on).await?;
+            let port = Port(i as u8);
+            self.dev.t1_set_loopback(port, on).await?;
+            if on {
+                self.looped |= 1 << i;
+                self.dev.set_learning(port, false).await?;
+                self.dev.flush_port(port).await?;
+            } else {
+                self.looped &= !(1 << i);
+                let applied = self.state.lock(|inner| inner.ports[i].stp.applied);
+                self.dev.write_stp_state(port, applied.into()).await?;
+            }
             info!("lan937x: port {} loopback {}", i + 1, on);
+        }
+        Ok(())
+    }
+
+    async fn apply_led_modes(&mut self) -> Result<(), Error<SPI::Error>> {
+        // Not while a PHY initializes: its reset reverts the mode anyway.
+        let ready = self.t1_ports
+            & !self
+                .t1_init
+                .iter()
+                .enumerate()
+                .fold(0u8, |m, (i, p)| m | ((p.is_some() as u8) << i));
+        let (mode, pending) = self.state.lock(|inner| {
+            let pending = inner.led_pending & ready;
+            inner.led_pending &= !pending;
+            (inner.led_mode, pending)
+        });
+        for i in 0..MAX_PORTS {
+            if pending & (1 << i) != 0 {
+                self.dev.t1_set_led_mode(Port(i as u8), mode).await?;
+            }
         }
         Ok(())
     }
@@ -414,6 +465,7 @@ where
         if done {
             self.t1_init[i] = None;
             debug!("lan937x: port {} PHY initialized", port.datasheet_number());
+            self.state.lock(|inner| inner.led_pending |= 1 << i);
             self.update_t1_link(port).await?;
             if !self.interrupts_enabled && self.t1_init.iter().all(Option::is_none) {
                 self.enable_interrupts().await?;
@@ -476,6 +528,46 @@ where
             t.rx_crc_errors += c[10];
         });
         Ok(())
+    }
+
+    async fn run_diag(&mut self, request: DiagRequest) -> Result<u64, DiagError> {
+        let t1_ports = self.t1_ports;
+        let t1 = |port: Port| t1_ports & (1 << port.0) != 0;
+        let result = match request {
+            DiagRequest::ReadReg { addr, width } => match width {
+                RegWidth::U8 => self.dev.regs().read8(addr).await.map(u64::from),
+                RegWidth::U16 => self.dev.regs().read16(addr).await.map(u64::from),
+                RegWidth::U32 => self.dev.regs().read32(addr).await.map(u64::from),
+            },
+            DiagRequest::WriteReg { addr, width, value } => match width {
+                RegWidth::U8 => self.dev.regs().write8(addr, value as u8).await.map(|_| 0),
+                RegWidth::U16 => self.dev.regs().write16(addr, value as u16).await.map(|_| 0),
+                RegWidth::U32 => self.dev.regs().write32(addr, value).await.map(|_| 0),
+            },
+            DiagRequest::ReadPhy { port, bank, reg } => {
+                if !t1(port) {
+                    return Err(DiagError::NotT1Port);
+                }
+                self.dev.t1_read(port, bank, reg).await.map(u64::from)
+            }
+            DiagRequest::WritePhy { port, bank, reg, value } => {
+                if !t1(port) {
+                    return Err(DiagError::NotT1Port);
+                }
+                self.dev.t1_write(port, bank, reg, value).await.map(|_| 0)
+            }
+            DiagRequest::ReadMib { port, index } => self.dev.read_mib(port, index).await,
+            DiagRequest::Sqi { port } => {
+                if !t1(port) {
+                    return Err(DiagError::NotT1Port);
+                }
+                self.dev.t1_sqi(port).await.map(u64::from)
+            }
+        };
+        result.map_err(|e| match e {
+            Error::Timeout => DiagError::Timeout,
+            _ => DiagError::Bus,
+        })
     }
 
     /// Direct access to the switch, for diagnostics. Don't change state the

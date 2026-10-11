@@ -3,6 +3,7 @@ use core::task::Waker;
 
 use embassy_sync::blocking_mutex::Mutex;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::mutex::Mutex as AsyncMutex;
 use embassy_sync::signal::Signal;
 use embassy_sync::waitqueue::AtomicWaker;
 use embassy_time::{Duration, Instant};
@@ -15,7 +16,7 @@ use xarxa_dsa::{
 
 use crate::Port;
 use crate::ptp::{self, PhcTime};
-use crate::t1::Role;
+use crate::t1::{Bank, LedMode, Role};
 
 type M = CriticalSectionRawMutex;
 
@@ -41,6 +42,53 @@ pub struct StateConfig {
     /// The spanning-tree state the user ports start in, matching
     /// [`Config::initial_state`](crate::Config::initial_state).
     pub initial_state: StpState,
+    /// What the T1 PHYs' LEDs show.
+    pub t1_led_mode: LedMode,
+}
+
+/// A register width, for [`DiagRequest`].
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegWidth {
+    U8,
+    U16,
+    U32,
+}
+
+/// A raw access for diagnostics, carried out by the runner between its own
+/// work. See [`SwitchState::diag`].
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiagRequest {
+    /// Read a switch register.
+    ReadReg { addr: u32, width: RegWidth },
+    /// Write a switch register.
+    WriteReg { addr: u32, width: RegWidth, value: u32 },
+    /// Read a register of a T1 port's PHY.
+    ReadPhy { port: Port, bank: Bank, reg: u8 },
+    /// Write a register of a T1 port's PHY.
+    WritePhy {
+        port: Port,
+        bank: Bank,
+        reg: u8,
+        value: u16,
+    },
+    /// Read a raw MIB counter (which clears it; the runner's totals miss it).
+    ReadMib { port: Port, index: u8 },
+    /// A T1 port's signal quality, 0 (worst) to 7.
+    Sqi { port: Port },
+}
+
+/// Why a [`DiagRequest`] failed.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiagError {
+    /// The switch didn't finish in time.
+    Timeout,
+    /// The bus failed.
+    Bus,
+    /// The port has no integrated T1 PHY.
+    NotT1Port,
 }
 
 /// A link change of an external PHY on an xMII port, from the task that
@@ -125,6 +173,9 @@ pub(crate) struct Inner {
     pub(crate) phc_reference: Option<(PhcTime, Instant)>,
     pub(crate) phc_step: Option<i64>,
     pub(crate) phc_rate: Option<i64>,
+    pub(crate) led_mode: LedMode,
+    /// Ports whose PHY LED mode must be (re)written.
+    pub(crate) led_pending: u8,
 }
 
 /// The shared state of a LAN937x. See the [module documentation](super).
@@ -134,10 +185,13 @@ pub(crate) struct Inner {
 pub struct SwitchState {
     pub(crate) config: StateConfig,
     pub(crate) inner: Mutex<M, RefCell<Inner>>,
-    events: PortEventChannel<M, 16, 4>,
+    events: PortEventChannel<M, 16, 6>,
     stack_waker: AtomicWaker,
     /// Wakes the runner: a request needs carrying out.
     pub(crate) work: Signal<M, ()>,
+    diag_lock: AsyncMutex<M, ()>,
+    pub(crate) diag_request: Signal<M, DiagRequest>,
+    pub(crate) diag_response: Signal<M, Result<u64, DiagError>>,
 }
 
 impl SwitchState {
@@ -165,11 +219,16 @@ impl SwitchState {
                 phc_reference: None,
                 phc_step: None,
                 phc_rate: None,
+                led_mode: config.t1_led_mode,
+                led_pending: 0,
             })),
             config,
             events: PortEventChannel::new(),
             stack_waker: AtomicWaker::new(),
             work: Signal::new(),
+            diag_lock: AsyncMutex::new(()),
+            diag_request: Signal::new(),
+            diag_response: Signal::new(),
         }
     }
 
@@ -197,11 +256,14 @@ impl SwitchState {
         self.work.signal(());
     }
 
-    /// Administratively enable or disable a port. A disabled port neither
-    /// sends nor receives anything through the host.
+    /// Administratively enable or disable a port. A disabled port's spanning
+    /// tree state is `Disabled` in hardware (applied), whatever was requested,
+    /// so it neither forwards nor reaches the host.
     pub fn set_port_enabled(&self, port: Port, enabled: bool) {
         self.lock(|inner| inner.ports[port.0 as usize].enabled = enabled);
         self.wake_stack();
+        // The runner sets the hardware state to match.
+        self.work.signal(());
     }
 
     /// Set a T1 port's master/slave role. Re-initializes its PHY, so the link
@@ -220,6 +282,25 @@ impl SwitchState {
     pub fn set_t1_loopback(&self, port: Port, on: bool) {
         self.lock(|inner| inner.ports[port.0 as usize].loopback = Some(on));
         self.work.signal(());
+    }
+
+    /// Set what the T1 PHYs' LEDs show.
+    pub fn set_t1_led_mode(&self, mode: LedMode) {
+        self.lock(|inner| {
+            inner.led_mode = mode;
+            inner.led_pending = 0xff;
+        });
+        self.work.signal(());
+    }
+
+    /// Carry out a raw access for diagnostics. Reads return the value;
+    /// writes return 0. One at a time; others wait.
+    pub async fn diag(&self, request: DiagRequest) -> Result<u64, DiagError> {
+        let _guard = self.diag_lock.lock().await;
+        self.diag_response.reset();
+        self.diag_request.signal(request);
+        self.work.signal(());
+        self.diag_response.wait().await
     }
 
     /// A snapshot of `port`.

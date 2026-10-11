@@ -17,7 +17,7 @@ mod runner;
 mod state;
 
 pub use runner::Runner;
-pub use state::{ExternalLink, PortCounters, PortStatus, StateConfig, SwitchState};
+pub use state::{DiagError, DiagRequest, ExternalLink, PortCounters, PortStatus, RegWidth, StateConfig, SwitchState};
 use xarxa_driver::PacketBuf;
 use xarxa_dsa::{Egress, PortId, RxTag, TagOverhead, TagProtocol, TxTag};
 

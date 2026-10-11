@@ -48,6 +48,11 @@ pub const GLB_CASCADE_MODE_EN: u32 = 1 << 15;
 
 /// Clock output control (8-bit): bit 1 disables CLK125, bit 0 disables CLKO_25M.
 pub const GLB_OUT_CLK_CTL: u32 = 0x0103;
+/// LED override (32-bit): bit n set makes LED_(n+1) a general purpose output.
+pub const GLB_LED_OVR: u32 = 0x0120;
+/// T1 LED select (32-bit): 3 bits per LED, from bit 0 for LED_1: the T1 AFE
+/// whose PHY LED signal drives it (6 and 7 = off).
+pub const GLB_LED_T1_SEL: u32 = 0x013C;
 
 // Global PHY control and straps (0x02xx).
 

@@ -24,7 +24,7 @@ pub mod ptp;
 #[cfg(feature = "xarxa")]
 pub mod xarxa;
 
-pub use device::{ChipId, Config, Lan937x, Xmii, delay_codes, mib};
+pub use device::{ChipId, Config, Lan937x, Xmii, delay_codes, lan9374_afe, mib};
 pub use stp::StpState;
 
 /// A switch port, numbered from zero: `Port(0)` is port 1 in the datasheet.
