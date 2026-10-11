@@ -97,6 +97,7 @@ where
         }
         self.apply_phc_requests().await?;
         self.apply_external_links().await?;
+        self.apply_loopbacks().await?;
         self.t1_init_step().await?;
 
         let now = Instant::now();
@@ -293,6 +294,20 @@ where
                     .await?;
             }
             self.set_link(port, link_from(&link));
+        }
+        Ok(())
+    }
+
+    async fn apply_loopbacks(&mut self) -> Result<(), Error<SPI::Error>> {
+        for i in 0..MAX_PORTS {
+            if self.t1_ports & (1 << i) == 0 || self.t1_init[i].is_some() {
+                continue;
+            }
+            let Some(on) = self.state.lock(|inner| inner.ports[i].loopback.take()) else {
+                continue;
+            };
+            self.dev.t1_set_loopback(Port(i as u8), on).await?;
+            info!("lan937x: port {} loopback {}", i + 1, on);
         }
         Ok(())
     }

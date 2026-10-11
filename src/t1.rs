@@ -248,6 +248,18 @@ impl<SPI: SpiDevice, D: DelayNs> Lan937x<SPI, D> {
         })
     }
 
+    /// Put `port`'s PHY in near-end loopback, or take it out: frames the switch
+    /// sends out of the port come back in on it.
+    pub async fn t1_set_loopback(&mut self, port: Port, on: bool) -> Result<(), Error<SPI::Error>> {
+        let bmcr = self.phy_read(port, BMCR).await?;
+        let bmcr = if on {
+            bmcr | BMCR_LOOPBACK
+        } else {
+            bmcr & !BMCR_LOOPBACK
+        };
+        self.phy_write(port, BMCR, bmcr).await
+    }
+
     /// The current signal quality of `port`'s link, 0 (worst) to 7 (best).
     pub async fn t1_sqi(&mut self, port: Port) -> Result<u8, Error<SPI::Error>> {
         Ok(((self.t1_read(port, Bank::Dsp, DSP_DCQ_SQI).await? >> 1) & 0x7) as u8)

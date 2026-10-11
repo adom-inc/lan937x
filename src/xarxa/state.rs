@@ -105,6 +105,8 @@ pub(crate) struct PortState {
     pub(crate) role: Option<Role>,
     /// The T1 PHY must be (re)initialized.
     pub(crate) reinit: bool,
+    /// A requested change of the T1 PHY's loopback.
+    pub(crate) loopback: Option<bool>,
     pub(crate) counters: PortCounters,
 }
 
@@ -149,6 +151,7 @@ impl SwitchState {
             flush_pending: false,
             role: None,
             reinit: false,
+            loopback: None,
             counters: PortCounters::default(),
         };
         let mut ports = [port; MAX_PORTS];
@@ -209,6 +212,13 @@ impl SwitchState {
             state.role = Some(role);
             state.reinit = true;
         });
+        self.work.signal(());
+    }
+
+    /// Put a T1 port's PHY in near-end loopback, or take it out, for testing:
+    /// frames sent out of the port come back in on it.
+    pub fn set_t1_loopback(&self, port: Port, on: bool) {
+        self.lock(|inner| inner.ports[port.0 as usize].loopback = Some(on));
         self.work.signal(());
     }
 
