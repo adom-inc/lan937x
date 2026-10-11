@@ -1,0 +1,30 @@
+[package]
+name = "lan937x"
+version = "0.1.0"
+edition = "2024"
+description = "Embedded Rust driver for the LAN937x series of automotive ethernet (100BASE-T1) switches from Microchip"
+authors = ["Adrian Wowk <dev@adrianwowk.com>"]
+
+[dependencies]
+embedded-hal = "1"
+embedded-hal-async = "1"
+mdio = { path = "../mdio" }
+defmt = { version = "1", optional = true }
+
+# we currently rely on a fork of xarxa that adds support for various DSA APIs
+xarxa-dsa = { path = "../xarxa-dsa", optional = true }
+xarxa-driver = { path = "../xarxa/xarxa-driver", optional = true }
+embassy-sync = { version = "0.8", optional = true }
+embassy-time = { version = "0.5", optional = true }
+embassy-futures = { version = "0.1", optional = true }
+heapless = { version = "0.9", optional = true }
+
+[features]
+defmt = ["dep:defmt", "xarxa-dsa?/defmt", "embassy-time?/defmt"]
+# Shared switch state and the switch task, implementing xarxa-dsa's traits for
+# use with embassy-net.
+xarxa = ["dep:xarxa-dsa", "dep:xarxa-driver", "dep:embassy-sync", "dep:embassy-time", "dep:embassy-futures", "dep:heapless"]
+
+[dev-dependencies]
+critical-section = { version = "1", features = ["std"] }
+embassy-time = { version = "0.5", features = ["mock-driver", "generic-queue-8"] }
