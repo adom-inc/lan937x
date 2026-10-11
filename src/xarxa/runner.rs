@@ -1,4 +1,4 @@
-use embassy_futures::select::select3;
+use embassy_futures::select::{select, select3};
 use embassy_time::{Duration, Instant, Timer};
 use embedded_hal::digital::InputPin;
 use embedded_hal_async::delay::DelayNs;
@@ -34,6 +34,9 @@ pub struct Runner<'a, SPI, D, IRQ> {
     next_link_poll: Instant,
     next_mib: Instant,
     mib_port: u8,
+    /// IRQ_N stayed asserted after servicing: a source this runner doesn't
+    /// clear. Don't spin on it.
+    irq_stuck: bool,
 }
 
 impl<'a, SPI, D, IRQ> Runner<'a, SPI, D, IRQ>
@@ -67,6 +70,7 @@ where
             next_link_poll: now + LINK_POLL,
             next_mib: now + MIB_TICK,
             mib_port: 0,
+            irq_stuck: false,
         }
     }
 
@@ -83,7 +87,20 @@ where
                 continue;
             }
             let deadline = self.next_deadline();
-            select3(self.state.work.wait(), self.irq.wait_for_low(), Timer::at(deadline)).await;
+            let stuck = self.irq.is_low().unwrap_or(false);
+            if stuck && !self.irq_stuck {
+                warning!("lan937x: IRQ_N stays asserted; polling it every 10 ms");
+            }
+            self.irq_stuck = stuck;
+            if stuck {
+                select(
+                    self.state.work.wait(),
+                    Timer::at(deadline.min(Instant::now() + Duration::from_millis(10))),
+                )
+                .await;
+            } else {
+                select3(self.state.work.wait(), self.irq.wait_for_low(), Timer::at(deadline)).await;
+            }
         }
     }
 
