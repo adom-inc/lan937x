@@ -57,6 +57,8 @@ pub const INT_MASK: u8 = 0x19;
 pub const INT_LINK_DOWN: u16 = 1 << 1;
 /// Link up interrupt.
 pub const INT_LINK_UP: u16 = 1 << 2;
+/// Energy off: nothing on the line any more (the other end went away).
+pub const INT_ENERGY_OFF: u16 = 1 << 6;
 /// Power-down control.
 pub const POWER_DOWN_CTL: u8 = 0x1A;
 
@@ -68,6 +70,13 @@ const MISC_INT2_SOURCE: u8 = 0x08;
 const MISC_INT2_MASK: u8 = 0x09;
 /// Communication ready (link up).
 const INT2_COMM_READY: u16 = 1 << 10;
+/// Local receiver down.
+const INT2_LOCAL_RCVR_DOWN: u16 = 1 << 5;
+/// Remote receiver down.
+const INT2_REMOTE_RCVR_DOWN: u16 = 1 << 7;
+/// Power-on ready: set at power-on, write 1 to clear (reading doesn't), and
+/// its mask bit is fixed on, so it can hold the port's PHY interrupt.
+const INT2_POR_READY: u16 = 1 << 11;
 /// DSP bank: coefficient read control. Bit 0 strobes the SQI registers' update.
 const DSP_COEF_RW_CTL: u8 = 0x0D;
 /// DSP bank: signal quality.
@@ -315,10 +324,15 @@ impl<SPI: SpiDevice, D: DelayNs> Lan937x<SPI, D> {
         Ok(((self.t1_read(port, Bank::Dsp, DSP_DCQ_SQI).await? >> 1) & 0x7) as u8)
     }
 
-    /// Acknowledge `port`'s PHY interrupts. Returns the interrupt source bits.
-    pub async fn t1_ack_interrupts(&mut self, port: Port) -> Result<u16, Error<SPI::Error>> {
-        let _ = self.t1_read(port, Bank::Misc, MISC_INT2_SOURCE).await?;
-        self.phy_read(port, INT_SOURCE).await
+    /// Acknowledge `port`'s PHY interrupts. Returns the interrupt source bits:
+    /// the main source (SMI 0x18) and interrupt 2 (MISC 0x08).
+    pub async fn t1_ack_interrupts(&mut self, port: Port) -> Result<(u16, u16), Error<SPI::Error>> {
+        let int2 = self.t1_read(port, Bank::Misc, MISC_INT2_SOURCE).await?;
+        if int2 & INT2_POR_READY != 0 {
+            self.t1_write(port, Bank::Misc, MISC_INT2_SOURCE, INT2_POR_READY)
+                .await?;
+        }
+        Ok((self.phy_read(port, INT_SOURCE).await?, int2))
     }
 
     /// Enable `port`'s PHY link interrupts (Linux `lan87xx_phy_config_intr`):
@@ -328,8 +342,14 @@ impl<SPI: SpiDevice, D: DelayNs> Lan937x<SPI, D> {
         self.phy_read(port, INT_SOURCE).await?;
         self.t1_write(port, Bank::Misc, MISC_INT2_MASK, 0).await?;
         self.t1_read(port, Bank::Misc, MISC_INT2_SOURCE).await?;
-        self.phy_write(port, INT_MASK, INT_LINK_DOWN).await?;
-        self.t1_write(port, Bank::Misc, MISC_INT2_MASK, INT2_COMM_READY).await
+        self.phy_write(port, INT_MASK, INT_LINK_DOWN | INT_ENERGY_OFF).await?;
+        self.t1_write(
+            port,
+            Bank::Misc,
+            MISC_INT2_MASK,
+            INT2_COMM_READY | INT2_LOCAL_RCVR_DOWN | INT2_REMOTE_RCVR_DOWN,
+        )
+        .await
     }
 
     /// Run one step of `init` on `port`. Returns `true` when it's done.

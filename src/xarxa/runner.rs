@@ -15,6 +15,8 @@ use crate::ptp::{self, TxClass};
 use crate::t1::{Role, T1Init};
 use crate::{Error, Lan937x, Port, mib, reg};
 
+/// Rounds in a row that may leave IRQ_N asserted before it counts as stuck.
+const MAX_IRQ_ROUNDS: u8 = 8;
 const PHC_REFRESH: Duration = Duration::from_secs(1);
 /// Interrupts carry link changes; this catches any that are missed.
 const LINK_POLL: Duration = Duration::from_secs(2);
@@ -42,6 +44,11 @@ pub struct Runner<'a, SPI, D, IRQ> {
     /// IRQ_N stayed asserted after servicing: a source this runner doesn't
     /// clear. Don't spin on it.
     irq_stuck: bool,
+    /// What the last round's interrupt service found: `None` if it didn't
+    /// run, else whether any port had an interrupt pending.
+    irq_found: Option<bool>,
+    /// Rounds in a row that left IRQ_N asserted.
+    irq_rounds: u8,
 }
 
 impl<'a, SPI, D, IRQ> Runner<'a, SPI, D, IRQ>
@@ -77,6 +84,8 @@ where
             mib_port: 0,
             looped: 0,
             irq_stuck: false,
+            irq_found: None,
+            irq_rounds: 0,
         }
     }
 
@@ -93,7 +102,17 @@ where
                 continue;
             }
             let deadline = self.next_deadline();
-            let stuck = self.irq.is_low().unwrap_or(false);
+            let low = self.irq.is_low().unwrap_or(false);
+            // Asserted after a round that cleared something, or didn't look:
+            // a new interrupt, so service it now. Stuck only if a round found
+            // nothing to clear and it's still asserted.
+            // A source that clearing doesn't release would keep this busy,
+            // though: after a few rounds it counts as stuck too.
+            self.irq_rounds = if low { self.irq_rounds.saturating_add(1) } else { 0 };
+            if low && self.irq_found != Some(false) && self.irq_rounds <= MAX_IRQ_ROUNDS {
+                continue;
+            }
+            let stuck = low;
             if stuck && !self.irq_stuck {
                 warning!("lan937x: IRQ_N stays asserted; polling it every 10 ms");
             }
@@ -119,6 +138,7 @@ where
             let result = self.run_diag(request).await;
             self.state.diag_response.signal(result);
         }
+        self.irq_found = None;
         if self.irq.is_low().unwrap_or(false) {
             self.service_interrupts().await?;
         }
@@ -257,6 +277,7 @@ where
 
     async fn service_interrupts(&mut self) -> Result<(), Error<SPI::Error>> {
         let pending = self.dev.pending_ports().await?;
+        self.irq_found = Some(pending != 0);
         for i in 0..self.state.config.ports {
             if pending & (1 << i) == 0 {
                 continue;
@@ -267,7 +288,15 @@ where
                 self.collect_timestamps(port).await?;
             }
             if sources & reg::P_INT_PHY != 0 {
-                self.dev.t1_ack_interrupts(port).await?;
+                let (int, int2) = self.dev.t1_ack_interrupts(port).await?;
+                let mode = self.dev.phy_read(port, crate::t1::MODE_STS).await?;
+                debug!(
+                    "lan937x: port {} PHY interrupt {:04x} {:04x} mode {:04x}",
+                    port.datasheet_number(),
+                    int,
+                    int2,
+                    mode
+                );
                 self.update_t1_link(port).await?;
             }
         }
