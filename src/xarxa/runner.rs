@@ -22,6 +22,10 @@ const PHC_REFRESH: Duration = Duration::from_secs(1);
 const LINK_POLL: Duration = Duration::from_secs(2);
 /// One port's counters are read per tick, well before any can wrap.
 const MIB_TICK: Duration = Duration::from_millis(500);
+/// The pause before a round that failed is tried again; it doubles, up to
+/// [`RETRY_MAX`], while rounds keep failing.
+const RETRY_FIRST: Duration = Duration::from_millis(10);
+const RETRY_MAX: Duration = Duration::from_millis(500);
 
 /// The task that services a LAN937x. See the [module documentation](super).
 pub struct Runner<'a, SPI, D, IRQ> {
@@ -41,9 +45,19 @@ pub struct Runner<'a, SPI, D, IRQ> {
     /// T1 ports whose PHY is in loopback. They don't learn: everything that
     /// comes back in on them was sent by someone else.
     looped: u8,
+    /// Each user port's spanning-tree state in the hardware (learning off if
+    /// it's looped), as far as the runner knows: `None` before it's written
+    /// and after a write that failed, so it's written again.
+    hw_stp: [Option<StpState>; MAX_PORTS],
+    /// The forwarding ports the hardware's membership masks are for, or
+    /// `None` before they're written and after a write that failed.
+    hw_membership: Option<u8>,
     /// IRQ_N stayed asserted after servicing: a source this runner doesn't
     /// clear. Don't spin on it.
     irq_stuck: bool,
+    /// Rounds failed in a row, and the pause before the next try.
+    failures: u32,
+    retry: Duration,
     /// What the last round's interrupt service found: `None` if it didn't
     /// run, else whether any port had an interrupt pending.
     irq_found: Option<bool>,
@@ -83,7 +97,11 @@ where
             next_mib: now + MIB_TICK,
             mib_port: 0,
             looped: 0,
+            hw_stp: [None; MAX_PORTS],
+            hw_membership: None,
             irq_stuck: false,
+            failures: 0,
+            retry: RETRY_FIRST,
             irq_found: None,
             irq_rounds: 0,
         }
@@ -92,9 +110,28 @@ where
     /// Run forever.
     pub async fn run(mut self) -> ! {
         loop {
-            if let Err(e) = self.service().await {
-                warning!("lan937x: switch access failed: {}", e.kind());
-                Timer::after_millis(10).await;
+            match self.service().await {
+                Ok(()) if self.failures != 0 => {
+                    info!(
+                        "lan937x: switch access works again after {} failed rounds",
+                        self.failures
+                    );
+                    self.failures = 0;
+                    self.retry = RETRY_FIRST;
+                }
+                Ok(()) => {}
+                Err(e) => {
+                    // What failed is still outstanding: try again soon, less
+                    // often while it keeps failing. Warn once per run of
+                    // failures.
+                    if self.failures == 0 {
+                        warning!("lan937x: switch access failed: {}; retrying", e.kind());
+                    }
+                    self.failures = self.failures.saturating_add(1);
+                    Timer::after(self.retry).await;
+                    self.retry = (self.retry * 2).min(RETRY_MAX);
+                    continue;
+                }
             }
             if self.t1_init_pending() {
                 // Initialization runs a step at a time; let other tasks in between.
@@ -131,39 +168,43 @@ where
 
     /// One round of work, in priority order (design §7.3): spanning-tree
     /// states and flushes, then PTP, then link changes, then the rest.
+    ///
+    /// Work that fails stays outstanding for the next round, and doesn't stop
+    /// the rest of this one (one failing PHY mustn't hold up the switch).
+    /// Returns the first error.
     async fn service(&mut self) -> Result<(), Error<SPI::Error>> {
-        self.apply_stp().await?;
-        self.apply_flushes().await?;
+        let mut result = self.apply_stp().await;
+        result = result.and(self.apply_flushes().await);
         if let Some(request) = self.state.diag_request.try_take() {
-            let result = self.run_diag(request).await;
-            self.state.diag_response.signal(result);
+            let response = self.run_diag(request).await;
+            self.state.diag_response.signal(response);
         }
         self.irq_found = None;
         if self.irq.is_low().unwrap_or(false) {
-            self.service_interrupts().await?;
+            result = result.and(self.service_interrupts().await);
         }
-        self.apply_phc_requests().await?;
-        self.apply_external_links().await?;
-        self.apply_power().await?;
-        self.apply_loopbacks().await?;
-        self.apply_led_modes().await?;
-        self.t1_init_step().await?;
+        result = result.and(self.apply_phc_requests().await);
+        result = result.and(self.apply_external_links().await);
+        result = result.and(self.apply_power().await);
+        result = result.and(self.apply_loopbacks().await);
+        result = result.and(self.apply_led_modes().await);
+        result = result.and(self.t1_init_step().await);
 
         let now = Instant::now();
         if now >= self.next_phc {
             self.next_phc = now + PHC_REFRESH;
-            self.refresh_phc().await?;
+            result = result.and(self.refresh_phc().await);
         }
         self.expire_timestamps();
         if now >= self.next_link_poll {
             self.next_link_poll = now + LINK_POLL;
-            self.poll_t1_links().await?;
+            result = result.and(self.poll_t1_links().await);
         }
         if now >= self.next_mib {
             self.next_mib = now + MIB_TICK;
-            self.read_counters().await?;
+            result = result.and(self.read_counters().await);
         }
-        Ok(())
+        result
     }
 
     fn next_deadline(&self) -> Instant {
@@ -183,19 +224,23 @@ where
         deadline
     }
 
-    /// Apply requested spanning-tree states, one port at a time, until none
-    /// is outstanding. Closing a port writes its state before the membership
-    /// masks, opening one after them, so no frame is forwarded through a port
-    /// that is being closed.
+    /// Apply requested spanning-tree states, one port at a time, until the
+    /// hardware has them all. Closing a port writes its state before the
+    /// membership masks, opening one after them, so no frame is forwarded
+    /// through a port that is being closed.
     ///
     /// Opening is reported before the writes and closing after them, so the
     /// applied state never understates the hardware (the `SwitchPorts`
     /// contract spanning tree relies on). A request that arrives meanwhile is
-    /// applied on the next pass.
+    /// applied on the next pass. What's written is compared with what the
+    /// hardware has, not with the applied state: an opening whose writes
+    /// failed after it was reported is still outstanding, and is written
+    /// again on the next round.
     async fn apply_stp(&mut self) -> Result<(), Error<SPI::Error>> {
-        let config = &self.state.config;
+        let state = self.state;
+        let config = &state.config;
         loop {
-            let next = self.state.lock(|inner| {
+            let (next, mut forwarding) = state.lock(|inner| {
                 let mut forwarding = 0u8;
                 let mut next = None;
                 for i in 0..config.ports as usize {
@@ -212,14 +257,15 @@ where
                     } else {
                         StpState::Disabled
                     };
-                    if next.is_none() && target != view.applied {
+                    if next.is_none() && (target != view.applied || self.hw_stp[i] != Some(target)) {
                         next = Some((i, target, view.applied));
                     }
                 }
-                next.map(|n| (n, forwarding))
+                (next, forwarding)
             });
-            let Some(((i, target, applied), mut forwarding)) = next else {
-                return Ok(());
+            let Some((i, target, applied)) = next else {
+                // Every state is in place; the masks may not be, after a failure.
+                return self.write_membership(forwarding).await;
             };
             let port = Port(i as u8);
             if target == StpState::Forwarding {
@@ -227,7 +273,7 @@ where
             } else {
                 forwarding &= !(1 << i);
             }
-            let report = |state: &SwitchState| {
+            let report = || {
                 state.lock(|inner| inner.ports[i].stp.applied = target);
                 debug!("lan937x: port {} now {}", port.datasheet_number(), target);
                 state.publish(PortEvent::StpApplied {
@@ -236,24 +282,50 @@ where
                 });
             };
             if target < applied {
-                self.dev.write_stp_state(port, target.into()).await?;
-                self.dev.write_membership(config.ports, config.host, forwarding).await?;
-                if self.looped & (1 << i) != 0 {
-                    self.dev.set_learning(port, false).await?;
-                }
-                report(self.state);
+                self.write_stp(port, target).await?;
+                self.write_membership(forwarding).await?;
+                report();
             } else {
-                report(self.state);
-                self.dev.write_membership(config.ports, config.host, forwarding).await?;
-                self.dev.write_stp_state(port, target.into()).await?;
-                if self.looped & (1 << i) != 0 {
-                    self.dev.set_learning(port, false).await?;
+                // Opening, or writing again what a failure left unknown.
+                if target != applied {
+                    report();
                 }
+                self.write_membership(forwarding).await?;
+                self.write_stp(port, target).await?;
             }
         }
     }
 
+    /// Write `port`'s spanning-tree state, unless the hardware has it.
+    async fn write_stp(&mut self, port: Port, state: StpState) -> Result<(), Error<SPI::Error>> {
+        let i = port.0 as usize;
+        if self.hw_stp[i] == Some(state) {
+            return Ok(());
+        }
+        self.hw_stp[i] = None;
+        self.dev.write_stp_state(port, state.into()).await?;
+        if self.looped & (1 << i) != 0 {
+            self.dev.set_learning(port, false).await?;
+        }
+        self.hw_stp[i] = Some(state);
+        Ok(())
+    }
+
+    /// Write the membership masks for the forwarding user ports `forwarding`,
+    /// unless the hardware has them.
+    async fn write_membership(&mut self, forwarding: u8) -> Result<(), Error<SPI::Error>> {
+        if self.hw_membership == Some(forwarding) {
+            return Ok(());
+        }
+        let config = &self.state.config;
+        self.hw_membership = None;
+        self.dev.write_membership(config.ports, config.host, forwarding).await?;
+        self.hw_membership = Some(forwarding);
+        Ok(())
+    }
+
     async fn apply_flushes(&mut self) -> Result<(), Error<SPI::Error>> {
+        let mut result = Ok(());
         for i in 0..self.state.config.ports as usize {
             let requested = self
                 .state
@@ -261,7 +333,14 @@ where
             if !requested {
                 continue;
             }
-            self.dev.flush_port(Port(i as u8)).await?;
+            if let Err(e) = self.dev.flush_port(Port(i as u8)).await {
+                // Retried next round. It may have left learning off: the
+                // spanning-tree state is written again first.
+                self.state.lock(|inner| inner.ports[i].flush_requested = true);
+                self.hw_stp[i] = None;
+                result = result.and(Err(e));
+                continue;
+            }
             let done = self.state.lock(|inner| {
                 let port = &mut inner.ports[i];
                 // A flush requested meanwhile is still pending.
@@ -272,7 +351,7 @@ where
                 self.state.publish(PortEvent::FlushDone { port: PortId(i as u8) });
             }
         }
-        Ok(())
+        result
     }
 
     async fn service_interrupts(&mut self) -> Result<(), Error<SPI::Error>> {
@@ -348,19 +427,30 @@ where
     }
 
     async fn apply_phc_requests(&mut self) -> Result<(), Error<SPI::Error>> {
-        let (step, rate) = self.state.lock(|inner| (inner.phc_step.take(), inner.phc_rate.take()));
-        if let Some(delta) = step {
-            self.dev.ptp_step(delta).await?;
+        if let Some(delta) = self.state.lock(|inner| inner.phc_step.take()) {
+            if let Err(e) = self.dev.ptp_step(delta).await {
+                // Retried next round, with any step requested meanwhile.
+                self.state
+                    .lock(|inner| inner.phc_step = Some(inner.phc_step.unwrap_or(0) + delta));
+                return Err(e);
+            }
             // Timestamps must be rebuilt from a reading after the step.
             self.refresh_phc().await?;
         }
-        if let Some(scaled_ppm) = rate {
-            self.dev.ptp_adjust_rate(scaled_ppm).await?;
+        if let Some(scaled_ppm) = self.state.lock(|inner| inner.phc_rate.take())
+            && let Err(e) = self.dev.ptp_adjust_rate(scaled_ppm).await
+        {
+            // Retried next round, unless a newer rate replaced it.
+            self.state.lock(|inner| {
+                inner.phc_rate.get_or_insert(scaled_ppm);
+            });
+            return Err(e);
         }
         Ok(())
     }
 
     async fn apply_external_links(&mut self) -> Result<(), Error<SPI::Error>> {
+        let mut result = Ok(());
         for i in 0..self.state.config.ports as usize {
             let Some(link) = self.state.lock(|inner| inner.external_links[i].take()) else {
                 continue;
@@ -368,16 +458,26 @@ where
             let port = Port(i as u8);
             if link.up {
                 // The MAC must match the PHY before traffic flows.
-                self.dev
+                let programmed = self
+                    .dev
                     .set_xmii_link(port, link.speed, link.duplex, link.tx_pause, link.rx_pause)
-                    .await?;
+                    .await;
+                if let Err(e) = programmed {
+                    // Retried next round, unless a newer change replaced it.
+                    self.state.lock(|inner| {
+                        inner.external_links[i].get_or_insert(link);
+                    });
+                    result = result.and(Err(e));
+                    continue;
+                }
             }
             self.set_link(port, link_from(&link));
         }
-        Ok(())
+        result
     }
 
     async fn apply_loopbacks(&mut self) -> Result<(), Error<SPI::Error>> {
+        let mut result = Ok(());
         for i in 0..MAX_PORTS {
             if self.t1_ports & (1 << i) == 0 || self.t1_init[i].is_some() {
                 continue;
@@ -385,25 +485,43 @@ where
             let Some(on) = self.state.lock(|inner| inner.ports[i].loopback.take()) else {
                 continue;
             };
-            let port = Port(i as u8);
-            self.dev.t1_set_loopback(port, on).await?;
-            if on {
-                self.looped |= 1 << i;
-                self.dev.set_learning(port, false).await?;
-                self.dev.flush_port(port).await?;
-            } else {
-                self.looped &= !(1 << i);
-                let applied = self.state.lock(|inner| inner.ports[i].stp.applied);
-                self.dev.write_stp_state(port, applied.into()).await?;
+            if let Err(e) = self.set_loopback(Port(i as u8), on).await {
+                // Retried next round, unless a newer request replaced it. It
+                // may have left learning wrong: the spanning-tree state is
+                // written again first.
+                self.state.lock(|inner| {
+                    inner.ports[i].loopback.get_or_insert(on);
+                });
+                self.hw_stp[i] = None;
+                result = result.and(Err(e));
             }
-            info!("lan937x: port {} loopback {}", i + 1, on);
         }
+        result
+    }
+
+    async fn set_loopback(&mut self, port: Port, on: bool) -> Result<(), Error<SPI::Error>> {
+        let i = port.0 as usize;
+        self.dev.t1_set_loopback(port, on).await?;
+        if on {
+            self.looped |= 1 << i;
+            self.dev.set_learning(port, false).await?;
+            self.dev.flush_port(port).await?;
+        } else {
+            self.looped &= !(1 << i);
+            // Learning as the state has it. One that isn't known is written
+            // by apply_stp.
+            if let Some(state) = self.hw_stp[i] {
+                self.dev.write_stp_state(port, state.into()).await?;
+            }
+        }
+        info!("lan937x: port {} loopback {}", port.datasheet_number(), on);
         Ok(())
     }
 
     /// Power T1 PHYs down when their port is disabled, and up (and
     /// reinitialize them) when it's enabled again.
     async fn apply_power(&mut self) -> Result<(), Error<SPI::Error>> {
+        let mut result = Ok(());
         for i in 0..MAX_PORTS {
             if self.t1_ports & (1 << i) == 0 {
                 continue;
@@ -412,13 +530,22 @@ where
                 continue;
             };
             let port = Port(i as u8);
-            if up {
-                self.dev.t1_set_power_down(port, false).await?;
-                self.state.lock(|inner| inner.ports[i].reinit = true);
-            } else {
+            if !up {
                 // An initialization in progress would power it up again.
                 self.t1_init[i] = None;
-                self.dev.t1_set_power_down(port, true).await?;
+            }
+            if let Err(e) = self.dev.t1_set_power_down(port, !up).await {
+                // Retried next round, unless the port was enabled or
+                // disabled again meanwhile.
+                self.state.lock(|inner| {
+                    inner.ports[i].power.get_or_insert(up);
+                });
+                result = result.and(Err(e));
+                continue;
+            }
+            if up {
+                self.state.lock(|inner| inner.ports[i].reinit = true);
+            } else {
                 self.set_link(port, PortLink::DOWN);
             }
             info!(
@@ -427,7 +554,7 @@ where
                 if up { "up" } else { "down" }
             );
         }
-        Ok(())
+        result
     }
 
     async fn apply_led_modes(&mut self) -> Result<(), Error<SPI::Error>> {
@@ -443,12 +570,18 @@ where
             inner.led_pending &= !pending;
             (inner.led_mode, pending)
         });
+        let mut result = Ok(());
         for i in 0..MAX_PORTS {
-            if pending & (1 << i) != 0 {
-                self.dev.t1_set_led_mode(Port(i as u8), mode).await?;
+            if pending & (1 << i) == 0 {
+                continue;
+            }
+            if let Err(e) = self.dev.t1_set_led_mode(Port(i as u8), mode).await {
+                // Retried next round.
+                self.state.lock(|inner| inner.led_pending |= 1 << i);
+                result = result.and(Err(e));
             }
         }
-        Ok(())
+        result
     }
 
     fn set_link(&self, port: Port, link: PortLink) {
@@ -542,13 +675,16 @@ where
             }
         };
         if done {
+            // It stays in progress until the link is read and, after the last
+            // PHY, interrupts are enabled, so a failure there is retried.
+            self.update_t1_link(port).await?;
+            let others = self.t1_init.iter().enumerate().any(|(j, p)| j != i && p.is_some());
+            if !self.interrupts_enabled && !others {
+                self.enable_interrupts().await?;
+            }
             self.t1_init[i] = None;
             debug!("lan937x: port {} PHY initialized", port.datasheet_number());
             self.state.lock(|inner| inner.led_pending |= 1 << i);
-            self.update_t1_link(port).await?;
-            if !self.interrupts_enabled && self.t1_init.iter().all(Option::is_none) {
-                self.enable_interrupts().await?;
-            }
         }
         Ok(())
     }
@@ -655,3 +791,6 @@ where
         &mut self.dev
     }
 }
+
+#[cfg(test)]
+mod tests;

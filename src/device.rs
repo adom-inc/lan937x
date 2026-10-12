@@ -510,6 +510,9 @@ impl<SPI: SpiDevice, D: DelayNs> Lan937x<SPI, D> {
 
     /// Flush the addresses the switch learned on `port` (Linux
     /// `ksz9477_flush_dyn_mac_table`).
+    ///
+    /// Learning is off on the port meanwhile, and back on afterwards even if
+    /// the flush fails, as far as the bus allows.
     pub async fn flush_port(&mut self, port: Port) -> Result<(), Error<SPI::Error>> {
         self.spi
             .modify8(
@@ -521,23 +524,28 @@ impl<SPI: SpiDevice, D: DelayNs> Lan937x<SPI, D> {
         // Entries of ports with learning disabled are flushed.
         let stp = reg::port(port, reg::P_STP_STATE);
         let state = self.spi.read8(stp).await?;
-        if state & reg::STP_LEARN_DIS == 0 {
-            self.spi.write8(stp, state | reg::STP_LEARN_DIS).await?;
+        if state & reg::STP_LEARN_DIS != 0 {
+            return self.flush_unlearned().await;
         }
+        let mut result = self.spi.write8(stp, state | reg::STP_LEARN_DIS).await;
+        if result.is_ok() {
+            result = self.flush_unlearned().await;
+        }
+        // Learning back on, whatever happened. The first error wins.
+        result.and(self.spi.write8(stp, state).await)
+    }
+
+    /// Flush the addresses learned on the ports with learning disabled.
+    async fn flush_unlearned(&mut self) -> Result<(), Error<SPI::Error>> {
         self.spi
             .modify8(reg::GLB_SW_LUE_CTL1, 0, reg::LUE_CTL1_FLUSH_MSTP)
             .await?;
-        let mut done = false;
         for _ in 0..BUSY_POLLS {
             if self.spi.read8(reg::GLB_SW_LUE_CTL1).await? & reg::LUE_CTL1_FLUSH_MSTP == 0 {
-                done = true;
-                break;
+                return Ok(());
             }
         }
-        if state & reg::STP_LEARN_DIS == 0 {
-            self.spi.write8(stp, state).await?;
-        }
-        if done { Ok(()) } else { Err(Error::Timeout) }
+        Err(Error::Timeout)
     }
 
     async fn flush_mib(&mut self, ports: u8) -> Result<(), Error<SPI::Error>> {
