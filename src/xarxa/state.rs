@@ -155,6 +155,9 @@ pub(crate) struct PortState {
     pub(crate) reinit: bool,
     /// A requested change of the T1 PHY's loopback.
     pub(crate) loopback: Option<bool>,
+    /// A requested power change of the T1 PHY (true: powered), from enabling
+    /// or disabling the port.
+    pub(crate) power: Option<bool>,
     pub(crate) counters: PortCounters,
 }
 
@@ -206,6 +209,7 @@ impl SwitchState {
             role: None,
             reinit: false,
             loopback: None,
+            power: None,
             counters: PortCounters::default(),
         };
         let mut ports = [port; MAX_PORTS];
@@ -258,10 +262,28 @@ impl SwitchState {
 
     /// Administratively enable or disable a port. A disabled port's spanning
     /// tree state is `Disabled` in hardware (applied), whatever was requested,
-    /// so it neither forwards nor reaches the host.
+    /// so it neither forwards nor reaches the host, and a T1 port's PHY is
+    /// powered down, so the link drops and the other end notices at once.
+    /// Enabling powers it up and reinitializes it with its role.
+    /// [`PortEvent::Enabled`] reports the change.
     pub fn set_port_enabled(&self, port: Port, enabled: bool) {
-        self.lock(|inner| inner.ports[port.0 as usize].enabled = enabled);
+        let changed = self.lock(|inner| {
+            let state = &mut inner.ports[port.0 as usize];
+            let changed = state.enabled != enabled;
+            state.enabled = enabled;
+            if changed {
+                state.power = Some(enabled);
+            }
+            changed
+        });
+        if !changed {
+            return;
+        }
         self.wake_stack();
+        self.publish(PortEvent::Enabled {
+            port: PortId(port.0),
+            enabled,
+        });
         // The runner sets the hardware state to match.
         self.work.signal(());
     }
@@ -462,6 +484,11 @@ impl SwitchPorts for SwitchState {
             inner.ports[i].flush_pending = true;
         });
         self.work.signal(());
+    }
+
+    fn enabled(&self, port: PortId) -> bool {
+        self.index(port)
+            .is_some_and(|i| self.lock(|inner| inner.ports[i].enabled))
     }
 
     fn flush_pending(&self, port: PortId) -> bool {

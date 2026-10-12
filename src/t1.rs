@@ -19,6 +19,8 @@ pub const BMCR: u8 = 0x00;
 pub const BMCR_RESET: u16 = 1 << 15;
 /// Loopback.
 pub const BMCR_LOOPBACK: u16 = 1 << 14;
+/// BMCR: power down. Not cleared by a soft reset.
+pub const BMCR_POWER_DOWN: u16 = 1 << 11;
 /// Basic status.
 pub const BMSR: u8 = 0x01;
 /// PHY identifier 1.
@@ -283,6 +285,18 @@ impl<SPI: SpiDevice, D: DelayNs> Lan937x<SPI, D> {
             bmcr | BMCR_LOOPBACK
         } else {
             bmcr & !BMCR_LOOPBACK
+        };
+        self.phy_write(port, BMCR, bmcr).await
+    }
+
+    /// Power `port`'s PHY down (the link drops) or up. A soft reset doesn't
+    /// clear power-down, so power up before reinitializing.
+    pub async fn t1_set_power_down(&mut self, port: Port, down: bool) -> Result<(), Error<SPI::Error>> {
+        let bmcr = self.phy_read(port, BMCR).await?;
+        let bmcr = if down {
+            bmcr | BMCR_POWER_DOWN
+        } else {
+            bmcr & !BMCR_POWER_DOWN
         };
         self.phy_write(port, BMCR, bmcr).await
     }

@@ -124,6 +124,7 @@ where
         }
         self.apply_phc_requests().await?;
         self.apply_external_links().await?;
+        self.apply_power().await?;
         self.apply_loopbacks().await?;
         self.apply_led_modes().await?;
         self.t1_init_step().await?;
@@ -371,6 +372,35 @@ where
         Ok(())
     }
 
+    /// Power T1 PHYs down when their port is disabled, and up (and
+    /// reinitialize them) when it's enabled again.
+    async fn apply_power(&mut self) -> Result<(), Error<SPI::Error>> {
+        for i in 0..MAX_PORTS {
+            if self.t1_ports & (1 << i) == 0 {
+                continue;
+            }
+            let Some(up) = self.state.lock(|inner| inner.ports[i].power.take()) else {
+                continue;
+            };
+            let port = Port(i as u8);
+            if up {
+                self.dev.t1_set_power_down(port, false).await?;
+                self.state.lock(|inner| inner.ports[i].reinit = true);
+            } else {
+                // An initialization in progress would power it up again.
+                self.t1_init[i] = None;
+                self.dev.t1_set_power_down(port, true).await?;
+                self.set_link(port, PortLink::DOWN);
+            }
+            info!(
+                "lan937x: port {} PHY powered {}",
+                port.datasheet_number(),
+                if up { "up" } else { "down" }
+            );
+        }
+        Ok(())
+    }
+
     async fn apply_led_modes(&mut self) -> Result<(), Error<SPI::Error>> {
         // Not while a PHY initializes: its reset reverts the mode anyway.
         let ready = self.t1_ports
@@ -427,7 +457,8 @@ where
 
     async fn poll_t1_links(&mut self) -> Result<(), Error<SPI::Error>> {
         for i in 0..MAX_PORTS {
-            if self.t1_ports & (1 << i) != 0 && self.t1_init[i].is_none() {
+            let enabled = self.state.lock(|inner| inner.ports[i].enabled);
+            if self.t1_ports & (1 << i) != 0 && self.t1_init[i].is_none() && enabled {
                 self.update_t1_link(Port(i as u8)).await?;
             }
         }
@@ -435,7 +466,11 @@ where
     }
 
     fn t1_init_pending(&self) -> bool {
-        self.t1_init.iter().any(Option::is_some) || self.state.lock(|inner| inner.ports.iter().any(|p| p.reinit))
+        // A disabled port's PHY stays powered down: its reinitialization waits.
+        self.t1_init.iter().any(Option::is_some)
+            || self
+                .state
+                .lock(|inner| inner.ports.iter().any(|p| p.reinit && p.enabled))
     }
 
     /// One step of a T1 PHY initialization, if any is due.
@@ -444,6 +479,9 @@ where
         for i in 0..MAX_PORTS {
             let role = self.state.lock(|inner| {
                 let port = &mut inner.ports[i];
+                if !port.enabled {
+                    return None;
+                }
                 core::mem::take(&mut port.reinit).then(|| port.role.unwrap_or(Role::Slave))
             });
             if let Some(role) = role {
