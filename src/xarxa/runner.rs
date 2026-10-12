@@ -166,6 +166,11 @@ where
     /// is outstanding. Closing a port writes its state before the membership
     /// masks, opening one after them, so no frame is forwarded through a port
     /// that is being closed.
+    ///
+    /// Opening is reported before the writes and closing after them, so the
+    /// applied state never understates the hardware (the `SwitchPorts`
+    /// contract spanning tree relies on). A request that arrives meanwhile is
+    /// applied on the next pass.
     async fn apply_stp(&mut self) -> Result<(), Error<SPI::Error>> {
         let config = &self.state.config;
         loop {
@@ -201,22 +206,29 @@ where
             } else {
                 forwarding &= !(1 << i);
             }
+            let report = |state: &SwitchState| {
+                state.lock(|inner| inner.ports[i].stp.applied = target);
+                debug!("lan937x: port {} now {}", port.datasheet_number(), target);
+                state.publish(PortEvent::StpApplied {
+                    port: PortId(i as u8),
+                    state: target,
+                });
+            };
             if target < applied {
                 self.dev.write_stp_state(port, target.into()).await?;
                 self.dev.write_membership(config.ports, config.host, forwarding).await?;
+                if self.looped & (1 << i) != 0 {
+                    self.dev.set_learning(port, false).await?;
+                }
+                report(self.state);
             } else {
+                report(self.state);
                 self.dev.write_membership(config.ports, config.host, forwarding).await?;
                 self.dev.write_stp_state(port, target.into()).await?;
+                if self.looped & (1 << i) != 0 {
+                    self.dev.set_learning(port, false).await?;
+                }
             }
-            if self.looped & (1 << i) != 0 {
-                self.dev.set_learning(port, false).await?;
-            }
-            self.state.lock(|inner| inner.ports[i].stp.applied = target);
-            debug!("lan937x: port {} now {}", port.datasheet_number(), target);
-            self.state.publish(PortEvent::StpApplied {
-                port: PortId(i as u8),
-                state: target,
-            });
         }
     }
 
