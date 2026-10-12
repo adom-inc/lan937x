@@ -1,4 +1,5 @@
 use core::cell::RefCell;
+use core::sync::atomic::{AtomicU32, Ordering};
 use core::task::Waker;
 
 use embassy_sync::blocking_mutex::Mutex;
@@ -195,6 +196,7 @@ pub struct SwitchState {
     diag_lock: AsyncMutex<M, ()>,
     pub(crate) diag_request: Signal<M, DiagRequest>,
     pub(crate) diag_response: Signal<M, Result<u64, DiagError>>,
+    rounds: AtomicU32,
 }
 
 impl SwitchState {
@@ -233,7 +235,18 @@ impl SwitchState {
             diag_lock: AsyncMutex::new(()),
             diag_request: Signal::new(),
             diag_response: Signal::new(),
+            rounds: AtomicU32::new(0),
         }
+    }
+
+    /// Rounds the runner has done, wrapping: at least two a second while it
+    /// runs, for a watchdog to check.
+    pub fn rounds(&self) -> u32 {
+        self.rounds.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn count_round(&self) {
+        self.rounds.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn lock<R>(&self, f: impl FnOnce(&mut Inner) -> R) -> R {

@@ -110,6 +110,7 @@ where
     /// Run forever.
     pub async fn run(mut self) -> ! {
         loop {
+            self.state.count_round();
             match self.service().await {
                 Ok(()) if self.failures != 0 => {
                     info!(

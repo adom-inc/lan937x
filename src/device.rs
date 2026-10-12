@@ -71,6 +71,11 @@ pub struct Config {
     pub other_xmii: Option<(Port, Xmii)>,
     /// The spanning-tree state user ports start in.
     pub initial_state: StpState,
+    /// Spanning tree runs on the host: BPDUs go to it only, from every port
+    /// whatever its state. Otherwise the switch is transparent to them, as a
+    /// bridge that doesn't run spanning tree must be: they're forwarded like
+    /// other multicast, so bridges around it can see loops through it.
+    pub stp_on_host: bool,
     /// The T1 LED pins: `t1_leds[n]` is the port LED_(n+1) shows (see
     /// [`Lan937x::set_t1_leds`]). Empty leaves the reset mapping, LED_(n+1)
     /// showing AFE n.
@@ -224,7 +229,7 @@ impl<SPI: SpiDevice, D: DelayNs> Lan937x<SPI, D> {
             self.set_t1_leds(config.t1_leds).await?;
         }
 
-        self.init_reserved_multicast(config.host).await?;
+        self.init_reserved_multicast(config.host, config.stp_on_host).await?;
         // PTP messages over 802.3 to their non-peer-delay group go to the host only.
         self.write_static_entry(0, [0x01, 0x1b, 0x19, 0, 0, 0], 1 << config.host.0, true)
             .await?;
@@ -379,13 +384,19 @@ impl<SPI: SpiDevice, D: DelayNs> Lan937x<SPI, D> {
         Ok(())
     }
 
-    /// Point the reserved multicast table at the host: spanning tree, 802.1X
-    /// and the other link-local groups (LLDP, PTP peer delay, slow protocols)
-    /// to the host only, from every port whatever its state; the GARP groups
-    /// and the rest to every port but the host.
-    async fn init_reserved_multicast(&mut self, host: Port) -> Result<(), Error<SPI::Error>> {
+    /// Point the reserved multicast table at the host: spanning tree (if
+    /// `stp_on_host`), 802.1X and the other link-local groups (LLDP, PTP peer
+    /// delay, slow protocols) to the host only, from every port whatever its
+    /// state; the GARP groups and the rest to every port but the host. Without
+    /// `stp_on_host`, spanning tree to every port, following port states.
+    async fn init_reserved_multicast(&mut self, host: Port, stp_on_host: bool) -> Result<(), Error<SPI::Error>> {
         let host_mask = 1u8 << host.0;
-        for group in [resv_group::STP, resv_group::DOT1X, resv_group::LINK_LOCAL] {
+        if stp_on_host {
+            self.write_reserved_multicast(resv_group::STP, host_mask, true).await?;
+        } else {
+            self.write_reserved_multicast(resv_group::STP, 0xff, false).await?;
+        }
+        for group in [resv_group::DOT1X, resv_group::LINK_LOCAL] {
             self.write_reserved_multicast(group, host_mask, true).await?;
         }
         for group in [resv_group::GMRP, resv_group::GVRP, resv_group::OTHER] {
